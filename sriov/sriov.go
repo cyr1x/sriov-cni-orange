@@ -239,24 +239,27 @@ func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 		if err != nil {
 			return fmt.Errorf("failed to rename vf %d device %q to %q: %v", vfIdx, vfDevName, ifName, err)
 		}
-		//compute free VFs available on node
-		k8s, err := createK8sClient(ckubeconfig)
-		if err != nil {
-			fmt.Println(fmt.Sprintf("%v", err))
+		if conf.Net.Kubernetes {
+			//compute free VFs available on node
+			k8s, err := createK8sClient(ckubeconfig)
+			if err != nil {
+				fmt.Println(fmt.Sprintf("%v", err))
+			}
+			mynode, err := getCurrentNode(k8s)
+			if err != nil {
+				fmt.Println(fmt.Sprintf("%v", err))
+			}
+			nbTotVF, err := getTotalVF(masterName)
+			if err != nil {
+				fmt.Println(fmt.Sprintf("%v", err))
+			}
+			nbFreeVF := getFreeVFs(masterName, nbTotVF)
+			errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
+			if errr != nil {
+				fmt.Println(fmt.Sprintf("%v", errr))
+			}
 		}
-		mynode, err := getCurrentNode(k8s)
-		if err != nil {
-			fmt.Println(fmt.Sprintf("%v", err))
-		}
-		nbTotVF, err := getTotalVF(masterName)
-		if err != nil {
-			fmt.Println(fmt.Sprintf("%v", err))
-		}
-		nbFreeVF := getFreeVFs(masterName, nbTotVF)
-		errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
-		if errr != nil {
-			fmt.Println(fmt.Sprintf("%v", errr))
-		}
+
 		return nil
 	})
 }
@@ -333,24 +336,26 @@ func releaseVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 			return fmt.Errorf("failed to move device %s to init netns: %v", ifName, err)
 		}
 
-		//compute free VFs available on node
-		masterName := conf.Net.Master
-		k8s, err := createK8sClient(ckubeconfig)
-		if err != nil {
-			fmt.Println(fmt.Sprintf("%v", err))
-		}
-		mynode, err := getCurrentNode(k8s)
-		if err != nil {
-			fmt.Println(fmt.Sprintf("%v", err))
-		}
-		nbTotVF, err := getTotalVF(masterName)
-		if err != nil {
-			fmt.Println(fmt.Sprintf("%v", err))
-		}
-		nbFreeVF := getFreeVFs(masterName, nbTotVF)
-		errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
-		if errr != nil {
-			fmt.Println(fmt.Sprintf("%v", errr))
+		if conf.Net.Kubernetes {
+			//compute free VFs available on node
+			masterName := conf.Net.Master
+			k8s, err := createK8sClient(ckubeconfig)
+			if err != nil {
+				fmt.Println(fmt.Sprintf("%v", err))
+			}
+			mynode, err := getCurrentNode(k8s)
+			if err != nil {
+				fmt.Println(fmt.Sprintf("%v", err))
+			}
+			nbTotVF, err := getTotalVF(masterName)
+			if err != nil {
+				fmt.Println(fmt.Sprintf("%v", err))
+			}
+			nbFreeVF := getFreeVFs(masterName, nbTotVF)
+			errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
+			if errr != nil {
+				fmt.Println(fmt.Sprintf("%v", errr))
+			}
 		}
 
 		return nil
