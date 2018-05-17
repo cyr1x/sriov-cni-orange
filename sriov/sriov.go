@@ -9,12 +9,21 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	//"encoding/json"
 
 	"github.com/containernetworking/cni/pkg/ipam"
 	"github.com/containernetworking/cni/pkg/ns"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/version"
 	"github.com/vishvananda/netlink"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+	//"k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	//"github.com/containernetworking/cni/pkg/types"
 
 	. "github.com/hustcat/sriov-cni/config"
 )
@@ -25,6 +34,107 @@ func init() {
 	// must ensure that the goroutine does not jump from OS thread to thread
 	runtime.LockOSThread()
 }
+
+//functions to deal with k8s client
+
+const ckubeconfig = "/etc/kubernetes/node-kubeconfig.yaml"
+const cmachineid = "/etc/machine-id"
+const cfreeVFAnnotation = "nbFreeVFs"
+
+func createK8sClient(kubeconfig string) (*kubernetes.Clientset, error) {
+
+	// uses the current context in kubeconfig
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("createK8sClient: failed to get context for the kubeconfig %v, refer cyrsriov README.md for the usage guide %v", kubeconfig, err)
+	}
+
+	// creates the clientset
+	return kubernetes.NewForConfig(config)
+}
+
+func getTotalVF(master string) (int, error) {
+
+	sriovFile := fmt.Sprintf("/sys/class/net/%s/device/sriov_numvfs", master)
+	if _, err := os.Lstat(sriovFile); err != nil {
+		return -1, fmt.Errorf("failed to open the sriov_numfs of device %q: %v", master, err)
+	}
+
+	data, err := ioutil.ReadFile(sriovFile)
+	if err != nil {
+		return -1, fmt.Errorf("failed to read the sriov_numfs of device %q: %v", master, err)
+	}
+
+	if len(data) == 0 {
+		return -1, fmt.Errorf("no data in the file %q", sriovFile)
+	}
+
+	sriovNumfs := strings.TrimSpace(string(data))
+	vfTotal, err := strconv.Atoi(sriovNumfs)
+	if err != nil {
+		return -1, fmt.Errorf("failed to convert sriov_numfs(byte value) to int of device %q: %v", master, err)
+	}
+
+	if vfTotal <= 0 {
+		return -1, fmt.Errorf("no virtual function in the device %q", master)
+	}
+	return vfTotal, nil
+
+}
+
+func getFreeVFs(master string, totalVFs int) int {
+
+	numFreeVFs := 0
+
+	for vf := 0; vf < totalVFs; vf++ {
+		_, err := getVFDeviceName(master, vf)
+
+		// got a free vf
+		if err == nil {
+			numFreeVFs++
+		}
+	}
+	return numFreeVFs
+
+}
+
+func getCurrentNode(k8s *kubernetes.Clientset) (*v1.Node, error) {
+
+	nodes, err := k8s.CoreV1().Nodes().List(metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("can't get node list: %v", err)
+	}
+	midbin, err := ioutil.ReadFile(cmachineid)
+	if err != nil {
+		return nil, fmt.Errorf("can't read kubernetes machine id: %v", err)
+	}
+	mid := strings.TrimRight(string(midbin), "\n")
+
+	for _, node := range nodes.Items {
+		nodeMid := node.Status.NodeInfo.MachineID
+
+		if mid == nodeMid {
+			//we found our node
+			return &node, nil
+		}
+	}
+	//shouldn'h happen
+	return nil, fmt.Errorf("can't find working node")
+}
+
+func setNodeFreeVFsAnnot(k8s *kubernetes.Clientset, mynode *v1.Node, freeVFs int) error {
+
+	annotations := mynode.GetObjectMeta().GetAnnotations()
+	annotations[cfreeVFAnnotation] = strconv.Itoa(freeVFs)
+	mynode.GetObjectMeta().SetAnnotations(annotations)
+	_, err := k8s.CoreV1().Nodes().Update(mynode)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+//end functions for k8s client
 
 func setupPF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 	var (
@@ -129,6 +239,24 @@ func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 		if err != nil {
 			return fmt.Errorf("failed to rename vf %d device %q to %q: %v", vfIdx, vfDevName, ifName, err)
 		}
+		//compute free VFs available on node
+		k8s, err := createK8sClient(ckubeconfig)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		mynode, err := getCurrentNode(k8s)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		nbTotVF, err := getTotalVF(masterName)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		nbFreeVF := getFreeVFs(masterName, nbTotVF)
+		errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
+		if errr != nil {
+			fmt.Println(fmt.Sprintf("%v", errr))
+		}
 		return nil
 	})
 }
@@ -205,11 +333,32 @@ func releaseVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 			return fmt.Errorf("failed to move device %s to init netns: %v", ifName, err)
 		}
 
+		//compute free VFs available on node
+		masterName := conf.Net.Master
+		k8s, err := createK8sClient(ckubeconfig)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		mynode, err := getCurrentNode(k8s)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		nbTotVF, err := getTotalVF(masterName)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		nbFreeVF := getFreeVFs(masterName, nbTotVF)
+		errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
+		if errr != nil {
+			fmt.Println(fmt.Sprintf("%v", errr))
+		}
+
 		return nil
 	})
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
+
 	n, err := LoadConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
