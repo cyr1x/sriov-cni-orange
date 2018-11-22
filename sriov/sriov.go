@@ -40,6 +40,7 @@ func init() {
 const ckubeconfig = "/etc/kubernetes/node-kubeconfig.yaml"
 const cmachineid = "/etc/machine-id"
 const cfreeVFAnnotation = "sriov/vfCount"
+const cfreeVFLabel = "sriov/freeVFAvailable"
 const cVLANAnnotation = "networks-sriov-vlan"
 const cTXRate = "networks-sriov-txrate"
 
@@ -139,6 +140,22 @@ func setNodeFreeVFsAnnot(k8s *kubernetes.Clientset, mynode *v1.Node, freeVFs int
 	annotations := mynode.GetObjectMeta().GetAnnotations()
 	annotations[cfreeVFAnnotation] = strconv.Itoa(freeVFs)
 	mynode.GetObjectMeta().SetAnnotations(annotations)
+	_, err := k8s.CoreV1().Nodes().Update(mynode)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func setNodeFreeVFsLabel(k8s *kubernetes.Clientset, mynode *v1.Node, freeVFs int) error {
+
+	labels := mynode.GetObjectMeta().GetLabels()
+	stillFreeFVs := "false"
+	if freeVFs > 0 {
+		stillFreeFVs = "true"
+	}
+	labels[cfreeVFLabel] = stillFreeFVs
+	mynode.GetObjectMeta().SetLabels(labels)
 	_, err := k8s.CoreV1().Nodes().Update(mynode)
 	if err != nil {
 		return err
@@ -344,6 +361,10 @@ func setupVF(conf *SriovConf, kconf K8sArgs, ifName string, netns ns.NetNS) erro
 		if errr != nil {
 			fmt.Println(fmt.Sprintf("%v", errr))
 		}
+		errr = setNodeFreeVFsLabel(k8s, mynode, nbFreeVF)
+		if errr != nil {
+			fmt.Println(fmt.Sprintf("%v", errr))
+		}
 
 		return nil
 	})
@@ -437,6 +458,10 @@ func releaseVF(conf *SriovConf, kconf K8sArgs, ifName string, netns ns.NetNS) er
 		}
 		nbFreeVF := getFreeVFs(masterName, nbTotVF)
 		errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
+		if errr != nil {
+			fmt.Println(fmt.Sprintf("%v", errr))
+		}
+		errr = setNodeFreeVFsLabel(k8s, mynode, nbFreeVF)
 		if errr != nil {
 			fmt.Println(fmt.Sprintf("%v", errr))
 		}
