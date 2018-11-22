@@ -15,7 +15,7 @@ import (
 	"github.com/containernetworking/cni/pkg/ns"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/version"
-	"github.com/vishvananda/netlink"
+	netlink "github.com/vishvananda/netlink"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -23,7 +23,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	//"github.com/containernetworking/cni/pkg/types"
+	"github.com/containernetworking/cni/pkg/types"
 
 	. "github.com/hustcat/sriov-cni/config"
 )
@@ -39,7 +39,9 @@ func init() {
 
 const ckubeconfig = "/etc/kubernetes/node-kubeconfig.yaml"
 const cmachineid = "/etc/machine-id"
-const cfreeVFAnnotation = "nbFreeVFs"
+const cfreeVFAnnotation = "sriov/vfCount"
+const cVLANAnnotation = "networks-sriov-vlan"
+const cTXRate = "networks-sriov-txrate"
 
 func createK8sClient(kubeconfig string) (*kubernetes.Clientset, error) {
 
@@ -51,6 +53,16 @@ func createK8sClient(kubeconfig string) (*kubernetes.Clientset, error) {
 
 	// creates the clientset
 	return kubernetes.NewForConfig(config)
+}
+
+func logtmp(msg string) {
+
+	f, _ := os.OpenFile("/tmp/dat.txt", os.O_APPEND|os.O_WRONLY, 0644)
+	defer f.Close()
+	_, _ = f.WriteString(msg)
+	_, _ = f.WriteString("\n")
+	f.Sync()
+
 }
 
 func getTotalVF(master string) (int, error) {
@@ -134,6 +146,35 @@ func setNodeFreeVFsAnnot(k8s *kubernetes.Clientset, mynode *v1.Node, freeVFs int
 	return nil
 }
 
+//from multus
+// K8sArgs is the valid CNI_ARGS used for Kubernetes
+type K8sArgs struct {
+	types.CommonArgs
+	IP                         net.IP
+	K8S_POD_NAME               types.UnmarshallableString
+	K8S_POD_NAMESPACE          types.UnmarshallableString
+	K8S_POD_INFRA_CONTAINER_ID types.UnmarshallableString
+}
+
+func getPodVLANAnnotation(k8s *kubernetes.Clientset, k K8sArgs) (string, error) {
+
+	pod, err := k8s.CoreV1().Pods(string(k.K8S_POD_NAMESPACE)).Get(fmt.Sprintf("%s", string(k.K8S_POD_NAME)), metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("getPodVLANAnnotation: failed to query the pod %v in out of cluster comm", string(k.K8S_POD_NAME))
+	}
+	//using multus names
+
+	return pod.Annotations[cVLANAnnotation], nil
+}
+func getPodTXRateAnnotation(k8s *kubernetes.Clientset, k K8sArgs) (string, error) {
+
+	pod, err := k8s.CoreV1().Pods(string(k.K8S_POD_NAMESPACE)).Get(fmt.Sprintf("%s", string(k.K8S_POD_NAME)), metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("getPodVLANAnnotation: failed to query the pod %v in out of cluster comm", string(k.K8S_POD_NAME))
+	}
+	return pod.Annotations[cTXRate], nil
+}
+
 //end functions for k8s client
 
 func setupPF(conf *SriovConf, ifName string, netns ns.NetNS) error {
@@ -175,7 +216,7 @@ func setupPF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 	})
 }
 
-func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
+func setupVF(conf *SriovConf, kconf K8sArgs, ifName string, netns ns.NetNS) error {
 	var (
 		err       error
 		vfDevName string
@@ -219,10 +260,59 @@ func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 		}
 	}
 
+	k8s, err := createK8sClient(ckubeconfig)
+	if err != nil {
+		fmt.Println(fmt.Sprintf("%v", err))
+		logtmp("createK8sClient failed")
+	}
+
+	//reset vlan/txrate
+	err = netlink.LinkSetVfTxRate(m, vfIdx, 0)
+	if err != nil {
+		fmt.Println(fmt.Sprintf("%v", err))
+	}
+	err = netlink.LinkSetVfVlan(m, vfIdx, 0)
+	if err != nil {
+		fmt.Println(fmt.Sprintf("%v", err))
+	}
+
 	if args.VLAN != 0 {
 		if err = netlink.LinkSetVfVlan(m, vfIdx, int(args.VLAN)); err != nil {
 			return fmt.Errorf("failed to set vf %d vlan: %v", vfIdx, err)
 		}
+	}
+
+	//sets vlan/txrate if right annotation set
+	vlan, err := getPodVLANAnnotation(k8s, kconf)
+
+	if err == nil && vlan != "" {
+		logtmp("entre dans if")
+		vlanint, err := strconv.Atoi(vlan)
+		if err != nil {
+			logtmp("getPodVLANAnnotation failed")
+			return fmt.Errorf("failed to set vlan %s on vf %d device %q to %q: %v", vlan, vfIdx, vfDevName, ifName, err)
+		}
+		err = netlink.LinkSetVfVlan(m, vfIdx, vlanint)
+		if err != nil {
+			logtmp("LinkSetVfVlan failed")
+			return fmt.Errorf("failed to set vlan %s on vf %d device %q to %q: %v", vlan, vfIdx, vfDevName, ifName, err)
+		}
+
+	}
+	txrate, err := getPodTXRateAnnotation(k8s, kconf)
+	logtmp(txrate)
+	if err == nil && txrate != "" {
+		txrateint, err := strconv.Atoi(txrate)
+		if err != nil {
+			logtmp("getPodTXRateAnnotation failed")
+			return fmt.Errorf("failed to set txrate %s on vf %d device %q to %q: %v", txrate, vfIdx, vfDevName, ifName, err)
+		}
+		err = netlink.LinkSetVfTxRate(m, vfIdx, txrateint)
+		if err != nil {
+			logtmp("LinkSetVfTxRate failed")
+			return fmt.Errorf("failed to set txrate %s on vf %d device %q to %q: %v", txrate, vfIdx, vfDevName, ifName, err)
+		}
+
 	}
 
 	if err = netlink.LinkSetUp(vfDev); err != nil {
@@ -239,25 +329,20 @@ func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 		if err != nil {
 			return fmt.Errorf("failed to rename vf %d device %q to %q: %v", vfIdx, vfDevName, ifName, err)
 		}
-		if conf.Net.Kubernetes {
-			//compute free VFs available on node
-			k8s, err := createK8sClient(ckubeconfig)
-			if err != nil {
-				fmt.Println(fmt.Sprintf("%v", err))
-			}
-			mynode, err := getCurrentNode(k8s)
-			if err != nil {
-				fmt.Println(fmt.Sprintf("%v", err))
-			}
-			nbTotVF, err := getTotalVF(masterName)
-			if err != nil {
-				fmt.Println(fmt.Sprintf("%v", err))
-			}
-			nbFreeVF := getFreeVFs(masterName, nbTotVF)
-			errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
-			if errr != nil {
-				fmt.Println(fmt.Sprintf("%v", errr))
-			}
+
+		//compute free VFs available on node
+		mynode, err := getCurrentNode(k8s)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		nbTotVF, err := getTotalVF(masterName)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		nbFreeVF := getFreeVFs(masterName, nbTotVF)
+		errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
+		if errr != nil {
+			fmt.Println(fmt.Sprintf("%v", errr))
 		}
 
 		return nil
@@ -301,7 +386,7 @@ func releasePF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 	})
 }
 
-func releaseVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
+func releaseVF(conf *SriovConf, kconf K8sArgs, ifName string, netns ns.NetNS) error {
 	initns, err := ns.GetCurrentNS()
 	if err != nil {
 		return fmt.Errorf("failed to get init netns: %v", err)
@@ -336,26 +421,24 @@ func releaseVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 			return fmt.Errorf("failed to move device %s to init netns: %v", ifName, err)
 		}
 
-		if conf.Net.Kubernetes {
-			//compute free VFs available on node
-			masterName := conf.Net.Master
-			k8s, err := createK8sClient(ckubeconfig)
-			if err != nil {
-				fmt.Println(fmt.Sprintf("%v", err))
-			}
-			mynode, err := getCurrentNode(k8s)
-			if err != nil {
-				fmt.Println(fmt.Sprintf("%v", err))
-			}
-			nbTotVF, err := getTotalVF(masterName)
-			if err != nil {
-				fmt.Println(fmt.Sprintf("%v", err))
-			}
-			nbFreeVF := getFreeVFs(masterName, nbTotVF)
-			errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
-			if errr != nil {
-				fmt.Println(fmt.Sprintf("%v", errr))
-			}
+		//compute free VFs available on node
+		masterName := conf.Net.Master
+		k8s, err := createK8sClient(ckubeconfig)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		mynode, err := getCurrentNode(k8s)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		nbTotVF, err := getTotalVF(masterName)
+		if err != nil {
+			fmt.Println(fmt.Sprintf("%v", err))
+		}
+		nbFreeVF := getFreeVFs(masterName, nbTotVF)
+		errr := setNodeFreeVFsAnnot(k8s, mynode, nbFreeVF)
+		if errr != nil {
+			fmt.Println(fmt.Sprintf("%v", errr))
 		}
 
 		return nil
@@ -369,6 +452,21 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
+	f, err := os.Create("/tmp/dat2")
+	defer f.Close()
+	_, err = f.WriteString(fmt.Sprintf("ContainerID: %v", args))
+	f.Sync()
+
+	kArgs := K8sArgs{}
+	err = types.LoadArgs(args.Args, &kArgs)
+	if err != nil {
+		return fmt.Errorf("failed to open K8sArgs %q: %v", kArgs, err)
+	}
+	f2, err := os.Create("/tmp/dat3")
+	defer f2.Close()
+	_, err = f2.WriteString(fmt.Sprintf("k8s: %v", kArgs))
+	f2.Sync()
+
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
 		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
@@ -376,7 +474,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	defer netns.Close()
 
 	if n.Net.PFOnly != true {
-		if err = setupVF(n, args.IfName, netns); err != nil {
+		if err = setupVF(n, kArgs, args.IfName, netns); err != nil {
 			return err
 		}
 	} else {
@@ -410,6 +508,11 @@ func cmdDel(args *skel.CmdArgs) error {
 	if err != nil {
 		return err
 	}
+	kArgs := K8sArgs{}
+	err = types.LoadArgs(args.Args, &kArgs)
+	if err != nil {
+		return fmt.Errorf("failed to open K8sArgs %q: %v", kArgs, err)
+	}
 
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
@@ -428,7 +531,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	defer netns.Close()
 
 	if n.Net.PFOnly != true {
-		if err = releaseVF(n, args.IfName, netns); err != nil {
+		if err = releaseVF(n, kArgs, args.IfName, netns); err != nil {
 			return err
 		}
 	} else {
