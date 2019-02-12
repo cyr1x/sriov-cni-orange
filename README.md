@@ -1,5 +1,36 @@
 # SR-IOV CNI plugin
 
+>> This is a fork of the Huscat sr-iov repository with added features <<
+
+Here is a short description of SR-IOV CNI plugin and added features 
+
+SR-IOV is an update of PCI Express specification to allow splitting a physical hardware resource (PF) into many virtual resources (VF) seen as lightweight PCIe functions. This is done by ensuring separation of its resource access. All is done in hardware, and this spec is not specific to network cards but is available as well for graphics cards and any PCIe card
+Each SR-IOV compatible network card can generally be splitted into as many as 32 VF per physical port, and each VF can be given a dedicated VLAN (all network card parameters can't be configured per VF though). Some implementations allow setting a bandwidth limitation per VF as well, to deal with priority (for instance, a particular VF can be allowed a max bandwidth of 5Gbps, and all others limited to 1 Gbps)
+As a result, a 2 port card can allow up to 64 containers to share the same 2 ports.
+
+SR-IOV CNI is an open source extension that was developed to allow Kubernetes pods to gain access to SR-IOV acceleration and get near native network performance.
+
+For NGPAAS, we forked this code to add several new features:
+1.1.    Node annotations to help deal with available VFs
+For simple Kubernetes installations (1 worker node with SR-IOV compatible card), it is easy to deal with available VFs, but as nodes increase in number and heterogeneity of hardware, it becomes painful to know which node owns free hardware resources in real time. More, when SR-IOV VFs are heavily used in a cluster, it results in unacceptable scheduling time because Kubernetes will attempt to find a node with free VF, but its standard scheduler is not aware of SR-IOV resources.
+To help dealing with free VFs, we added code that maintains in real time 2 annotations for each worker node:
+1.1.1.   sriov/vfCount 
+This annotation is an integer that gives in real time the number of free VFs for a given node. It can be retrieved like any other annotation, and, for example, a custom scheduler extender can take advantage of this to exclude nodes without anymore free VF (Cf. our work on a scheduler extender)
+
+1.1.2.   sriov/freeVFAvailable=true
+This annotation is a label that only exists on worker nodes hosting free SR-IOV VFs. As a result, a pod requiring a SR-IOV network interface can specify its needs as easily as:
+      nodeSelector:
+        sriov/freeVFAvailable: true
+1.2.     Pod new annotations to set useful VF properties
+The current SR-IOV CNI doesn’t allow to set a VLAN nor a bandwidth limitation for a VF in a Kubernetes context. We added 2 annotations to be set in a pod definition yaml that allow its VF network interface to be automatically configured when the pod is created.
+1.2.1.   VLAN
+If a pod definition contains the following annotation: networks-sriov-vlan, its VF will be configured to send and receive packets tagged for a specified VLAN. This enables the use of VLANs for groups of Pods to separate traffic
+1.2.2.   Outgoing Bandwidth limitation
+If a pod definition contains the following annotation: networks-sriov-txrate, its VF will be throttled by the SR-IOV network card to allow at most the outgoing network bandwidth specified in the annotation (in Mbps). There is obviously no effect on the incoming packets.
+
+----------------------------------
+
+
 If you do not know CNI. Please read [here](https://github.com/containernetworking/cni) at first.
 
 NIC with [SR-IOV](http://blog.scottlowe.org/2009/12/02/what-is-sr-iov/) capabilities works by introducing the idea of physical functions (PFs) and virtual functions (VFs). 
